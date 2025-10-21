@@ -1,0 +1,38 @@
+# --- venv ---
+.venv/
+venv/
+
+# --- build artifacts ---
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- test & tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage*
+htmlcov/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- local config & secrets ---
+.env
+.env.*
+!.env.example
