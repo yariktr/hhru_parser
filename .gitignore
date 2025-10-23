@@ -36,3 +36,8 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# cookies / secrets
+secrets/
+*.cookies.json
+cookies*.json
