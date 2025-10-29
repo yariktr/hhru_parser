@@ -169,53 +169,107 @@ def _fetch_top_companies(limit: int = 10) -> list[tuple[str | None, int]]:
             (limit,),
         )
         return cur.fetchall()
+    
 
 def compute_basic_stats(currency: str = "RUB") -> dict:
     """
-    Считает базовые статистики:
-    - avg/median зарплаты по exp_bucket (только для выбранной валюты)
-    - распределение по schedule
-    - топ компаний
+    Возвращает словарь со сводной статистикой:
+      - salary_by_experience: [{exp_bucket, count, avg, median, currency}]
+      - schedule_distribution: [{schedule, count}]
+      - top_companies: [{company_name, count}]
+    Все агрегаты считаются только по таблице vacancies без JOIN/UNNEST,
+    чтобы исключить размножение строк.
     """
-    rows = _fetch_rows_for_salary(currency=currency)
-    by_bucket: dict[str, list[int]] = {}
-    for bucket, s_from, s_to in rows:
-        # нормализуем зарплату в одно число
-        val = None
-        if s_from is not None and s_to is not None:
-            val = (s_from + s_to) // 2
-        elif s_from is not None:
-            val = s_from
-        elif s_to is not None:
-            val = s_to
-        if val is None:
-            continue
-        key = bucket or "unknown"
-        by_bucket.setdefault(key, []).append(val)
+    with _conn() as conn, conn.cursor() as cur:
+        # --- 1) Зарплата по группам опыта ---
+        # Нормализуем "числовую" зарплату как среднее из (salary_from, salary_to), если есть обе.
+        # Фильтруем по целевой валюте и только по тем вакансиям, где есть хотя бы одно из полей.
+        cur.execute(
+            """
+            WITH base AS (
+                SELECT
+                    COALESCE(NULLIF(exp_bucket, ''), 'unknown') AS exp_bucket,
+                    CASE
+                        WHEN salary_from IS NOT NULL AND salary_to IS NOT NULL
+                            THEN (salary_from + salary_to) / 2.0
+                        WHEN salary_from IS NOT NULL
+                            THEN salary_from::float
+                        WHEN salary_to IS NOT NULL
+                            THEN salary_to::float
+                        ELSE NULL
+                    END AS sal
+                FROM vacancies
+                WHERE salary_currency = %s
+                  AND (salary_from IS NOT NULL OR salary_to IS NOT NULL)
+            )
+            SELECT
+                exp_bucket,
+                COUNT(*) AS count,
+                ROUND(AVG(sal))::float AS avg,
+                ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal))::float AS median
+            FROM base
+            GROUP BY exp_bucket
+            ORDER BY
+                CASE exp_bucket
+                    WHEN '0-1' THEN 1
+                    WHEN '1-3' THEN 2
+                    WHEN '3-6' THEN 3
+                    WHEN '6+'  THEN 4
+                    ELSE 5
+                END, exp_bucket;
+            """,
+            (currency,),
+        )
+        salary_rows = [
+            {
+                "exp_bucket": r[0],
+                "count": int(r[1]),
+                "avg": r[2],
+                "median": r[3],
+                "currency": currency,
+            }
+            for r in cur.fetchall()
+        ]
 
-    agg_by_bucket = []
-    for key, vals in by_bucket.items():
-        if not vals:
-            continue
-        avg_v = sum(vals) / len(vals)
-        med_v = median(vals)
-        agg_by_bucket.append({
-            "exp_bucket": key,
-            "count": len(vals),
-            "avg": round(avg_v, 2),
-            "median": float(med_v),
-            "currency": currency,
-        })
-    # стабильный порядок: 0-1,1-3,3-6,6+,unknown
-    order = {"0-1": 0, "1-3": 1, "3-6": 2, "6+": 3}
-    agg_by_bucket.sort(key=lambda d: (order.get(d["exp_bucket"], 9), d["exp_bucket"]))
+        # --- 2) Распределение по формату работы ---
+        cur.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(schedule, ''), 'unknown') AS schedule,
+                COUNT(*) AS count
+            FROM vacancies
+            GROUP BY COALESCE(NULLIF(schedule, ''), 'unknown')
+            ORDER BY count DESC, schedule;
+            """
+        )
+        schedule_rows = [{"schedule": r[0], "count": int(r[1])} for r in cur.fetchall()]
 
-    schedule = [{"schedule": k, "count": v} for k, v in _fetch_counts_by_schedule()]
-    top_companies = [{"company_name": k, "count": v} for k, v in _fetch_top_companies(limit=10)]
+        # --- 3) Топ компаний ---
+        cur.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(company_name, ''), 'unknown') AS company_name,
+                COUNT(*) AS count
+            FROM vacancies
+            GROUP BY COALESCE(NULLIF(company_name, ''), 'unknown')
+            ORDER BY count DESC, company_name
+            LIMIT 15;
+            """
+        )
+        top_companies_rows = [{"company_name": r[0], "count": int(r[1])} for r in cur.fetchall()]
 
     return {
-        "salary_by_experience": agg_by_bucket,
-        "schedule_distribution": schedule,
-        "top_companies": top_companies,
+        "salary_by_experience": salary_rows,
+        "schedule_distribution": schedule_rows,
+        "top_companies": top_companies_rows,
     }
+
+
+def existing_ids(ids: list[str]) -> set[str]:
+    """Вернёт множество id, которые уже есть в таблице vacancies."""
+    if not ids:
+        return set()
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM vacancies WHERE id = ANY(%s);", (ids,))
+        return {row[0] for row in cur.fetchall()}
 

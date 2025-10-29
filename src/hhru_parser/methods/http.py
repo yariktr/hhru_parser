@@ -1,24 +1,29 @@
 from __future__ import annotations
-import logging, json, os
+import logging, json, os, sys
 import re
 import time
 import random
+import asyncio
 from statistics import mean, median
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import aiohttp
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from dataclasses import asdict
 
 from hhru_parser.models import Vacancy
+from hhru_parser.bd.bd_vacancy import existing_ids
+
 
 class HTTPParser:
     SEARCH_URL = "https://hh.ru/search/vacancy"
 
     def __init__(self, cookies_file: str | None = None):
         self.log = logging.getLogger(__name__)
-        
+
+        # анти-бан
         self.base_delay = 2.0
         self.jitter = 0.6
         self.backoff_factor = 2.0
@@ -27,6 +32,10 @@ class HTTPParser:
         self.current_delay = self.base_delay
         self._success_streak = 0
 
+        # одновременных запросов
+        self.max_concurrency = 3
+        self._lock: asyncio.Lock | None = None
+
         ua_pool = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
@@ -34,6 +43,7 @@ class HTTPParser:
         ]
         ua = random.choice(ua_pool)
 
+        # requests-сессия (источник кук)
         self.sess = requests.Session()
         self.sess.headers.update({
             "User-Agent": ua,
@@ -51,14 +61,14 @@ class HTTPParser:
             else:
                 self.log.warning("Не удалось подгрузить куки из файла: %s — работаем без кук", cookies_file)
 
-
+    # ---------------- cookies ----------------
     def _load_cookies_from_json(self, path: str) -> bool:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             jar = requests.cookies.RequestsCookieJar()
 
-            if isinstance(data, dict) and "cookies" in data and isinstance(data["cookies"], list):
+            if isinstance(data, dict) and isinstance(data.get("cookies"), list):
                 cookies_iter = data["cookies"]
             elif isinstance(data, list):
                 cookies_iter = data
@@ -86,92 +96,163 @@ class HTTPParser:
         except Exception as e:
             self.log.warning("Ошибка загрузки cookies (%s): %s", type(e).__name__, path)
             return False
-        
-    def _sleep_with_jitter(self) -> None:
+
+    def _cookies_for_aiohttp(self) -> aiohttp.CookieJar | None:
+        if not self.sess.cookies:
+            return None
+        jar = aiohttp.CookieJar()
+        for c in self.sess.cookies:
+            try:
+                resp_url = f"https://{c.domain or 'hh.ru'}{c.path or '/'}"
+                jar.update_cookies({c.name: c.value}, response_url=resp_url)
+            except Exception:
+                jar.update_cookies({c.name: c.value}, response_url="https://hh.ru/")
+        return jar
+
+    # ---------------- анти-бан ----------------
+    async def _ensure_lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+    async def _sleep_with_jitter_async(self):
         j = random.uniform(-self.jitter, self.jitter)
         pause = max(0.0, self.current_delay + j)
         if pause >= 0.01:
-            time.sleep(pause)
-        self.log.debug("sleep %.2fs (delay=%.2f, jitter=%.2f)", pause, self.current_delay, j)
+            self.log.debug("sleep %.2fs (delay=%.2f, jitter=%+.2f)", pause, self.current_delay, j)
+            await asyncio.sleep(pause)
 
-    def _on_block(self, status: int, url: str) -> None:
-        # экспоненциальный бэкофф при 403/429
-        old = self.current_delay
-        self.current_delay = min(self.current_delay * self.backoff_factor, self.max_delay)
-        self._success_streak = 0
-        self.log.warning("Block %s on %s → backoff delay: %.2fs → %.2fs",
-                        status, url, old, self.current_delay)
-
-    def _on_success(self) -> None:
-        # плавное снижение задержки к базовой после серии успехов
-        self._success_streak += 1
-        if self._success_streak >= self.success_to_relax and self.current_delay > self.base_delay:
+    async def _on_block_async(self, status: int, url: str):
+        await self._ensure_lock()
+        async with self._lock:
             old = self.current_delay
-            # шаг к базовой (10% расстояния)
-            self.current_delay = max(self.base_delay, self.base_delay + 0.9 * (self.current_delay - self.base_delay))
+            self.current_delay = min(self.current_delay * self.backoff_factor, self.max_delay)
             self._success_streak = 0
-            self.log.info("Relax delay: %.2fs → %.2fs", old, self.current_delay)
+            self.log.warning("Block %s on %s → backoff delay: %.2fs → %.2fs", status, url, old, self.current_delay)
 
-            
+    async def _on_success_async(self):
+        await self._ensure_lock()
+        async with self._lock:
+            self._success_streak += 1
+            if self._success_streak >= self.success_to_relax and self.current_delay > self.base_delay:
+                old = self.current_delay
+                self.current_delay = max(self.base_delay, self.base_delay + 0.9 * (self.current_delay - self.base_delay))
+                self._success_streak = 0
+                self.log.info("Relax delay: %.2fs → %.2fs", old, self.current_delay)
 
+    # ---------------- публичное API ----------------
     def search(self, query: str, limit: int = 5) -> Tuple[List[Dict], Dict]:
+        """Синхронная оболочка над async-реализацией (совместимость со скриптами)."""
+        return asyncio.run(self.search_async(query=query, limit=limit))
+
+    async def search_async(self, query: str, limit: int = 5) -> Tuple[List[Dict], Dict]:
+        await self._ensure_lock()
         t0 = time.perf_counter()
-        self.log.info("Поиск: %r (limit=%d)", query, limit)
+        self.log.info("Поиск (async): %r (limit=%d)", query, limit)
 
-        r = self.sess.get(self.SEARCH_URL, params={"text": query}, timeout=(5, 20))
-        r.raise_for_status()
+        cookie_jar = self._cookies_for_aiohttp()
+        headers = dict(self.sess.headers)
+        connector = aiohttp.TCPConnector(limit=self.max_concurrency)
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        total_found = self._extract_total_found(soup)
-        if total_found is not None:
-            self.log.info("Найдено всего по запросу: %s", total_found)
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar, connector=connector, headers=headers) as session:
+            # 1) выдача
+            async with session.get(self.SEARCH_URL, params={"text": query},
+                                   timeout=aiohttp.ClientTimeout(sock_connect=5, total=20)) as r:
+                r.raise_for_status()
+                html = await r.text()
 
-        links = [a.get("href") for a in soup.select("a.serp-item__title") if a.get("href")]
-        if not links:
-            links = []
-            for a in soup.find_all("a", href=True):
-                if re.search(r"/vacancy/\d+", a["href"]):
-                    links.append(a["href"].split("?")[0])
+            soup = BeautifulSoup(html, "html.parser")
+            total_found = self._extract_total_found(soup)
+            if total_found is not None:
+                self.log.info("Найдено всего по запросу: %s", total_found)
 
-        seen, uniq = set(), []
-        for u in links:
-            u = u.split("?")[0]
-            if u not in seen:
-                seen.add(u); uniq.append(u)
-        uniq = uniq[:limit]
-        self.log.info("Ссылок к обработке: %d", len(uniq))
+            links = [a.get("href") for a in soup.select("a.serp-item__title") if a.get("href")]
+            if not links:
+                links = []
+                for a in soup.find_all("a", href=True):
+                    if re.search(r"/vacancy/\d+", a["href"]):
+                        links.append(a["href"].split("?")[0])
 
-        out: List[Dict] = []
-        per_item_times: List[float] = []
+            seen, uniq = set(), []
+            for u in links:
+                u = u.split("?")[0]
+                if u not in seen:
+                    seen.add(u); uniq.append(u)
+            uniq = uniq[:limit]
+            self.log.info("Ссылок к обработке: %d", len(uniq))
 
-        for url in tqdm(uniq, desc="Вакансии", unit="шт"):
-            self._sleep_with_jitter()
-            t1 = time.perf_counter()
+            # --- кэш по БД ---
+            def id_from_url(u: str) -> str:
+                m = re.search(r"/vacancy/(\d+)", u)
+                return m.group(1) if m else u
 
-            rr = self.sess.get(url, timeout=(5, 20))
+            ids_all = [id_from_url(u) for u in uniq]
+            known = existing_ids(ids_all)
+            if known:
+                before = len(uniq)
+                uniq = [u for u in uniq if id_from_url(u) not in known]
+                self.log.info("После кэша в БД к загрузке осталось: %d (из %d)", len(uniq), before)
 
-            if rr.status_code in (403, 429):
-                self._on_block(rr.status_code, url)
-                continue 
+            # 2) карточки — параллельно
+            sem = asyncio.Semaphore(self.max_concurrency)
 
-            rr.raise_for_status()
+            async def worker(u: str) -> tuple[dict | None, float]:
+                async with sem:
+                    await self._sleep_with_jitter_async()
+                    t1 = time.perf_counter()
+                    try:
+                        async with session.get(u, timeout=aiohttp.ClientTimeout(sock_connect=5, total=20)) as resp:
+                            if resp.status in (403, 429):
+                                await self._on_block_async(resp.status, u)
+                                return None, time.perf_counter() - t1
+                            resp.raise_for_status()
+                            html2 = await resp.text()
+                    except aiohttp.ClientResponseError as e:
+                        self.log.warning("HTTP error %s on %s", e.status, u)
+                        return None, time.perf_counter() - t1
+                    except Exception as e:
+                        self.log.warning("Network error %s on %s", type(e).__name__, u)
+                        return None, time.perf_counter() - t1
 
-            s2 = BeautifulSoup(rr.text, "html.parser")
-            item = self.parse_vacancy(s2, url)
-            out.append(asdict(item))
+                    s2 = BeautifulSoup(html2, "html.parser")
+                    item = self.parse_vacancy(s2, u)
+                    await self._on_success_async()
+                    dt = time.perf_counter() - t1
+                    self.log.debug("OK %s (%.2f сек) | delay=%.2fs", u, dt, self.current_delay)
+                    return asdict(item), dt
 
-            dt = time.perf_counter() - t1
-            per_item_times.append(dt)
+            tasks = [asyncio.create_task(worker(u)) for u in uniq]
+            out: List[Dict] = []
+            per_item_times: List[float] = []
 
-            self._on_success()  
-            self.log.debug("OK %s (%.2f сек)", url, dt)
+            # единый прогресс-бар (stdout)
+            pbar = tqdm(total=len(tasks), desc="Вакансии", unit="шт",
+                        file=sys.stdout, dynamic_ncols=True, leave=False)
+            try:
+                for task in asyncio.as_completed(tasks):
+                    item, dt = await task
+                    if item:
+                        out.append(item)
+                    if dt is not None:
+                        per_item_times.append(dt)
 
+                    # компактный статус прямо в полосе
+                    if item:
+                        vid = item.get("id")
+                        ttl = (item.get("title") or "")
+                        if len(ttl) > 40:
+                            ttl = ttl[:37] + "…"
+                        pbar.set_postfix_str(f"{len(out)}/{len(tasks)} id={vid} {dt:.2f}s {ttl}")
+                    else:
+                        pbar.set_postfix_str(f"{len(out)}/{len(tasks)}")
+                    pbar.update(1)
+            finally:
+                pbar.close()
 
         total_time = time.perf_counter() - t0
         avg_sec = round(mean(per_item_times), 3) if per_item_times else None
         med_sec = round(median(per_item_times), 3) if per_item_times else None
         self.log.info(
-            "Готово: обработано %d, общая длительность %.2f сек, среднее на карточку %s сек, медиана %s сек",
+            "Готово (async): обработано %d, общая длительность %.2f сек, среднее на карточку %s сек, медиана %s сек",
             len(out), total_time, avg_sec, med_sec
         )
 
@@ -296,13 +377,14 @@ class HTTPParser:
         elif len(nums) >= 2:
             s_from, s_to = to_int(nums[0]), to_int(nums[1])
         currency = None
-        if "₽" in text or "руб" in text.lower():
+        low = text.lower()
+        if "₽" in text or "руб" in low:
             currency = "RUB"
-        elif "€" in text or "eur" in text.lower():
+        elif "€" in text or "eur" in low:
             currency = "EUR"
-        elif "$" in text or "usd" in text.lower():
+        elif "$" in text or "usd" in low:
             currency = "USD"
-        is_gross = True if "до вычета" in text.lower() else None
+        is_gross = True if "до вычета" in low else None
         return s_from, s_to, currency, is_gross, text
 
     def _parse_experience(self, soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
@@ -313,7 +395,7 @@ class HTTPParser:
             text = cand.strip() if cand else None
         bucket = None
         if text:
-            m = re.search(r"(\d)[–-](\d)", text) 
+            m = re.search(r"(\d)[–-](\d)", text)
             if m:
                 lo, hi = int(m.group(1)), int(m.group(2))
                 if hi <= 1: bucket = "0-1"
@@ -364,7 +446,7 @@ class HTTPParser:
         return None
 
     def _parse_responses_count(self, soup: BeautifulSoup) -> Optional[int]:
-        el = soup.find(string=re.compile(r"тклик", re.I)) 
+        el = soup.find(string=re.compile(r"тклик", re.I))
         if not el:
             return None
         m = re.search(r"(\d+)", el)
