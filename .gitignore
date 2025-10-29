@@ -41,3 +41,5 @@ htmlcov/
 secrets/
 *.cookies.json
 cookies*.json
+
+logs/
